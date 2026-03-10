@@ -73,7 +73,7 @@ We built Fantasy to power [Crush](https://github.com/charmbracelet/crush), a hot
 - Image models
 - Audio models
 - PDF uploads
-- Provider tools (e.g. web_search)
+- Provider tools (partial: Anthropic computer use supported; e.g. web_search not yet)
 
 For things you’d like to see supported, PRs are welcome.
 
