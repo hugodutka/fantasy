@@ -428,7 +428,18 @@ func (a languageModel) toTools(tools []fantasy.Tool, toolChoice *fantasy.ToolCho
 			anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{OfTool: &anthropicTool})
 			continue
 		}
-		// TODO: handle provider tool calls
+		if tool.GetType() == fantasy.ToolTypeProviderDefined {
+			if IsComputerUseTool(tool) {
+				// Computer use tools are handled by the beta API path.
+				continue
+			}
+			warnings = append(warnings, fantasy.CallWarning{
+				Type:    fantasy.CallWarningTypeUnsupportedTool,
+				Tool:    tool,
+				Message: "tool is not supported",
+			})
+			continue
+		}
 		warnings = append(warnings, fantasy.CallWarning{
 			Type:    fantasy.CallWarningTypeUnsupportedTool,
 			Tool:    tool,
@@ -771,7 +782,16 @@ func (a languageModel) Generate(ctx context.Context, call fantasy.Call) (*fantas
 	if err != nil {
 		return nil, err
 	}
-	response, err := a.client.Messages.New(ctx, *params)
+
+	var reqOpts []option.RequestOption
+	if needsBetaAPI(call.Tools) {
+		reqOpts, err = computerUseRequestOptions(call.Tools, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	response, err := a.client.Messages.New(ctx, *params, reqOpts...)
 	if err != nil {
 		return nil, toProviderErr(err)
 	}
@@ -849,7 +869,15 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 		return nil, err
 	}
 
-	stream := a.client.Messages.NewStreaming(ctx, *params)
+	var reqOpts []option.RequestOption
+	if needsBetaAPI(call.Tools) {
+		reqOpts, err = computerUseRequestOptions(call.Tools, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	stream := a.client.Messages.NewStreaming(ctx, *params, reqOpts...)
 	acc := anthropic.Message{}
 	return func(yield func(fantasy.StreamPart) bool) {
 		if len(warnings) > 0 {
