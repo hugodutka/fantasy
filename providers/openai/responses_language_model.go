@@ -13,6 +13,7 @@ import (
 	"charm.land/fantasy/schema"
 	"github.com/google/uuid"
 	"github.com/openai/openai-go/v2"
+	"github.com/openai/openai-go/v2/option"
 	"github.com/openai/openai-go/v2/packages/param"
 	"github.com/openai/openai-go/v2/responses"
 	"github.com/openai/openai-go/v2/shared"
@@ -28,7 +29,6 @@ type responsesLanguageModel struct {
 }
 
 // newResponsesLanguageModel implements a responses api model
-// INFO: (kujtim) currently we do not support stored parameter we default it to false.
 func newResponsesLanguageModel(modelID string, provider string, client openai.Client, objectMode fantasy.ObjectMode) responsesLanguageModel {
 	return responsesLanguageModel{
 		modelID:    modelID,
@@ -121,9 +121,7 @@ func getResponsesModelConfig(modelID string) responsesModelConfig {
 
 func (o responsesLanguageModel) prepareParams(call fantasy.Call) (*responses.ResponseNewParams, []fantasy.CallWarning) {
 	var warnings []fantasy.CallWarning
-	params := &responses.ResponseNewParams{
-		Store: param.NewOpt(false),
-	}
+	params := &responses.ResponseNewParams{}
 
 	modelConfig := getResponsesModelConfig(o.modelID)
 
@@ -333,6 +331,28 @@ func toResponsesPrompt(prompt fantasy.Prompt, systemMessageMode string) (respons
 	var input responses.ResponseInputParam
 	var warnings []fantasy.CallWarning
 
+	// First pass: collect raw JSON for computer call IDs so we can
+	// reconstruct them faithfully in the assistant and tool branches.
+	computerCallRawJSON := make(map[string]string)
+	for _, msg := range prompt {
+		if msg.Role != fantasy.MessageRoleAssistant {
+			continue
+		}
+		for _, c := range msg.Content {
+			if c.GetType() != fantasy.ContentTypeToolCall {
+				continue
+			}
+			toolCallPart, ok := fantasy.AsContentType[fantasy.ToolCallPart](c)
+			if !ok {
+				continue
+			}
+			meta := GetComputerUseMetadata(toolCallPart.ProviderOptions)
+			if meta != nil && meta.RawJSON != "" {
+				computerCallRawJSON[toolCallPart.ToolCallID] = meta.RawJSON
+			}
+		}
+	}
+
 	for _, msg := range prompt {
 		switch msg.Role {
 		case fantasy.MessageRoleSystem:
@@ -479,6 +499,16 @@ func toResponsesPrompt(prompt fantasy.Prompt, systemMessageMode string) (respons
 						continue
 					}
 
+					// Route computer calls via param.Override to
+					// preserve the full wire format including
+					// batched actions.
+						if rawJSON, ok := computerCallRawJSON[toolCallPart.ToolCallID]; ok {
+							overridden := param.Override[responses.ResponseComputerToolCallParam](json.RawMessage(rawJSON))
+							input = append(input, responses.ResponseInputItemUnionParam{
+								OfComputerCall: &overridden,
+							})
+							continue
+						}
 					inputJSON, err := json.Marshal(toolCallPart.Input)
 					if err != nil {
 						warnings = append(warnings, fantasy.CallWarning{
@@ -543,38 +573,62 @@ func toResponsesPrompt(prompt fantasy.Prompt, systemMessageMode string) (respons
 				}
 
 				toolResultPart, ok := fantasy.AsContentType[fantasy.ToolResultPart](c)
-				if !ok {
-					warnings = append(warnings, fantasy.CallWarning{
-						Type:    fantasy.CallWarningTypeOther,
-						Message: "tool message result part does not have the right type",
-					})
-					continue
-				}
-
-				var outputStr string
-				switch toolResultPart.Output.GetType() {
-				case fantasy.ToolResultContentTypeText:
-					output, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](toolResultPart.Output)
 					if !ok {
 						warnings = append(warnings, fantasy.CallWarning{
 							Type:    fantasy.CallWarningTypeOther,
-							Message: "tool result output does not have the right type",
+							Message: "tool message result part does not have the right type",
 						})
 						continue
 					}
-					outputStr = output.Text
-				case fantasy.ToolResultContentTypeError:
-					output, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentError](toolResultPart.Output)
-					if !ok {
-						warnings = append(warnings, fantasy.CallWarning{
-							Type:    fantasy.CallWarningTypeOther,
-							Message: "tool result output does not have the right type",
-						})
-						continue
-					}
-					outputStr = output.Error.Error()
-				}
 
+					// Computer call outputs use a dedicated input
+					// item type with a screenshot param.
+					if _, isComputer := computerCallRawJSON[toolResultPart.ToolCallID]; isComputer {
+						screenshot := responses.ResponseComputerToolCallOutputScreenshotParam{}
+						if toolResultPart.Output.GetType() == fantasy.ToolResultContentTypeMedia {
+							media, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentMedia](toolResultPart.Output)
+							if ok && strings.HasPrefix(media.MediaType, "image/") {
+								imageURL := fmt.Sprintf("data:%s;base64,%s", media.MediaType, media.Data)
+								screenshot.ImageURL = param.NewOpt(imageURL)
+							}
+						}
+						input = append(input, responses.ResponseInputItemParamOfComputerCallOutput(toolResultPart.ToolCallID, screenshot))
+						continue
+					}
+
+					var outputStr string
+					switch toolResultPart.Output.GetType() {
+					case fantasy.ToolResultContentTypeText:
+						output, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](toolResultPart.Output)
+						if !ok {
+							warnings = append(warnings, fantasy.CallWarning{
+								Type:    fantasy.CallWarningTypeOther,
+								Message: "tool result output does not have the right type",
+							})
+							continue
+						}
+						outputStr = output.Text
+					case fantasy.ToolResultContentTypeError:
+						output, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentError](toolResultPart.Output)
+						if !ok {
+							warnings = append(warnings, fantasy.CallWarning{
+								Type:    fantasy.CallWarningTypeOther,
+								Message: "tool result output does not have the right type",
+							})
+							continue
+						}
+						outputStr = output.Error.Error()
+					case fantasy.ToolResultContentTypeMedia:
+						media, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentMedia](toolResultPart.Output)
+						if !ok {
+							warnings = append(warnings, fantasy.CallWarning{
+								Type:    fantasy.CallWarningTypeOther,
+								Message: "tool result output does not have the right type",
+							})
+							continue
+						}
+						outputStr = media.Text
+					}
 				input = append(input, responses.ResponseInputItemParamOfFunctionCallOutput(toolResultPart.ToolCallID, outputStr))
 			}
 		}
@@ -590,7 +644,7 @@ func hasVisibleResponsesUserContent(content responses.ResponseInputMessageConten
 func hasVisibleResponsesAssistantContent(items []responses.ResponseInputItemUnionParam, startIdx int) bool {
 	// Check if we added any assistant content parts from this message
 	for i := startIdx; i < len(items); i++ {
-		if items[i].OfMessage != nil || items[i].OfFunctionCall != nil {
+		if items[i].OfMessage != nil || items[i].OfFunctionCall != nil || items[i].OfComputerCall != nil {
 			return true
 		}
 	}
@@ -625,6 +679,12 @@ func toResponsesTools(tools []fantasy.Tool, toolChoice *fantasy.ToolChoice, opti
 					Type:        "function",
 				},
 			})
+			continue
+		}
+
+		// Computer use tools are injected via request options, not
+		// the tools array, so skip them here without a warning.
+		if IsComputerUseTool(tool) {
 			continue
 		}
 
@@ -668,7 +728,13 @@ func toResponsesTools(tools []fantasy.Tool, toolChoice *fantasy.ToolChoice, opti
 
 func (o responsesLanguageModel) Generate(ctx context.Context, call fantasy.Call) (*fantasy.Response, error) {
 	params, warnings := o.prepareParams(call)
-	response, err := o.client.Responses.New(ctx, *params, callUARequestOptions(call)...)
+	var reqOpts []option.RequestOption
+	if hasComputerUseTool(call.Tools) {
+		reqOpts = computerUseTools(params)
+	}
+	reqOpts = append(reqOpts, callUARequestOptions(call)...)
+
+	response, err := o.client.Responses.New(ctx, *params, reqOpts...)
 	if err != nil {
 		return nil, toProviderErr(err)
 	}
@@ -729,6 +795,23 @@ func (o responsesLanguageModel) Generate(ctx context.Context, call fantasy.Call)
 				ToolCallID:       outputItem.CallID,
 				ToolName:         outputItem.Name,
 				Input:            outputItem.Arguments,
+			})
+
+		case "computer_call":
+			rawJSON := outputItem.RawJSON()
+			callID, input, err := parseComputerCall(rawJSON)
+			if err != nil {
+				continue
+			}
+			hasFunctionCall = true
+			content = append(content, fantasy.ToolCallContent{
+				ProviderExecuted: false,
+				ToolCallID:       callID,
+				ToolName:         "computer",
+				Input:            input,
+				ProviderMetadata: fantasy.ProviderMetadata{
+					Name: &ComputerUseMetadata{RawJSON: rawJSON},
+				},
 			})
 
 		case "reasoning":
@@ -806,7 +889,13 @@ func mapResponsesFinishReason(reason string, hasFunctionCall bool) fantasy.Finis
 func (o responsesLanguageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
 	params, warnings := o.prepareParams(call)
 
-	stream := o.client.Responses.NewStreaming(ctx, *params, callUARequestOptions(call)...)
+	var reqOpts []option.RequestOption
+	if hasComputerUseTool(call.Tools) {
+		reqOpts = computerUseTools(params)
+	}
+	reqOpts = append(reqOpts, callUARequestOptions(call)...)
+
+	stream := o.client.Responses.NewStreaming(ctx, *params, reqOpts...)
 
 	finishReason := fantasy.FinishReasonUnknown
 	var usage fantasy.Usage
@@ -843,6 +932,21 @@ func (o responsesLanguageModel) Stream(ctx context.Context, call fantasy.Call) (
 						Type:         fantasy.StreamPartTypeToolInputStart,
 						ID:           added.Item.CallID,
 						ToolCallName: added.Item.Name,
+					}) {
+						return
+					}
+
+				case "computer_call":
+					// Computer calls arrive complete; track them for
+					// output_item.done.
+					ongoingToolCalls[added.OutputIndex] = &ongoingToolCall{
+						toolName:   "computer",
+						toolCallID: added.Item.CallID,
+					}
+					if !yield(fantasy.StreamPart{
+						Type:         fantasy.StreamPartTypeToolInputStart,
+						ID:           added.Item.CallID,
+						ToolCallName: "computer",
 					}) {
 						return
 					}
@@ -898,6 +1002,37 @@ func (o responsesLanguageModel) Stream(ctx context.Context, call fantasy.Call) (
 							ID:            done.Item.CallID,
 							ToolCallName:  done.Item.Name,
 							ToolCallInput: done.Item.Arguments,
+						}) {
+							return
+						}
+					}
+
+				case "computer_call":
+					tc := ongoingToolCalls[done.OutputIndex]
+					if tc != nil {
+						delete(ongoingToolCalls, done.OutputIndex)
+						hasFunctionCall = true
+
+						rawJSON := done.Item.RawJSON()
+						callID, input, parseErr := parseComputerCall(rawJSON)
+						if parseErr != nil {
+							continue
+						}
+
+						if !yield(fantasy.StreamPart{
+							Type: fantasy.StreamPartTypeToolInputEnd,
+							ID:   callID,
+						}) {
+							return
+						}
+						if !yield(fantasy.StreamPart{
+							Type:          fantasy.StreamPartTypeToolCall,
+							ID:            callID,
+							ToolCallName:  "computer",
+							ToolCallInput: input,
+							ProviderMetadata: fantasy.ProviderMetadata{
+								Name: &ComputerUseMetadata{RawJSON: rawJSON},
+							},
 						}) {
 							return
 						}
