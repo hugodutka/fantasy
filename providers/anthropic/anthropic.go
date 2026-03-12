@@ -480,14 +480,23 @@ func (a languageModel) toTools(tools []fantasy.Tool, toolChoice *fantasy.ToolCho
 				})
 				continue
 			}
+			if IsComputerUseTool(tool) {
+				// Computer use tools are handled by the beta API path.
+				continue
+			}
+			warnings = append(warnings, fantasy.CallWarning{
+				Type:    fantasy.CallWarningTypeUnsupportedTool,
+				Tool:    tool,
+				Message: "tool is not supported",
+			})
+			continue
 		}
 		warnings = append(warnings, fantasy.CallWarning{
 			Type:    fantasy.CallWarningTypeUnsupportedTool,
 			Tool:    tool,
 			Message: "tool is not supported",
 		})
-	}
-
+		}
 	// NOTE: Bedrock does not support this attribute.
 	var disableParallelToolUse param.Opt[bool]
 	if !a.options.useBedrock {
@@ -901,7 +910,16 @@ func (a languageModel) Generate(ctx context.Context, call fantasy.Call) (*fantas
 	if err != nil {
 		return nil, err
 	}
-	response, err := a.client.Messages.New(ctx, *params, callUARequestOptions(call)...)
+	reqOpts := callUARequestOptions(call)
+	if needsBetaAPI(call.Tools) {
+		cuOpts, err := computerUseRequestOptions(call.Tools, params)
+		if err != nil {
+			return nil, err
+		}
+		reqOpts = append(reqOpts, cuOpts...)
+	}
+
+	response, err := a.client.Messages.New(ctx, *params, reqOpts...)
 	if err != nil {
 		return nil, toProviderErr(err)
 	}
@@ -1029,7 +1047,16 @@ func (a languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 		return nil, err
 	}
 
-	stream := a.client.Messages.NewStreaming(ctx, *params, callUARequestOptions(call)...)
+	reqOpts := callUARequestOptions(call)
+	if needsBetaAPI(call.Tools) {
+		cuOpts, err := computerUseRequestOptions(call.Tools, params)
+		if err != nil {
+			return nil, err
+		}
+		reqOpts = append(reqOpts, cuOpts...)
+	}
+
+	stream := a.client.Messages.NewStreaming(ctx, *params, reqOpts...)
 	acc := anthropic.Message{}
 	return func(yield func(fantasy.StreamPart) bool) {
 		if len(warnings) > 0 {
